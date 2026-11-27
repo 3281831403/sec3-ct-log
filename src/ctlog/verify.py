@@ -17,6 +17,7 @@ SIGNATURE_HMAC_SHA256 = 4
 _LOG_ID_SIZE = 32
 _LEAF_HASH_SIZE = 32
 _SCT_VERSION = 1
+_DEFAULT_SUPPORTED_VERSIONS = (_SCT_VERSION,)
 
 
 def _as_bytes(value: bytes | bytearray | memoryview, *, name: str) -> bytes:
@@ -40,12 +41,14 @@ def _signed_payload(sct: dict) -> bytes:
     log_id = _as_bytes(sct.get("log_id") or b"", name="log_id")
     tree_size = int(sct.get("tree_size") or 0)
     leaf = _as_bytes(sct.get("leaf_hash") or b"", name="leaf_hash")
+    extensions = _as_bytes(sct.get("extensions") or b"", name="extensions")
     return (
         bytes([version & 0xFF])
         + log_id
         + _timestamp_bytes(sct.get("timestamp"))
         + tree_size.to_bytes(8, "big")
         + leaf
+        + extensions
     )
 
 
@@ -106,7 +109,12 @@ def parse_sct(raw: bytes) -> dict:
 def check_version(sct: dict, policy: dict) -> bool:
     """Return whether the timestamp carries a supported version."""
     version = sct.get("version")
-    return isinstance(version, int) and not isinstance(version, bool) and version >= 0
+    if not isinstance(version, int) or isinstance(version, bool):
+        return False
+    supported = (policy or {}).get("supported_versions")
+    if supported is None:
+        supported = _DEFAULT_SUPPORTED_VERSIONS
+    return version in tuple(supported)
 
 
 def check_log_id(sct: dict, trusted: list[bytes]) -> bool:
@@ -114,16 +122,26 @@ def check_log_id(sct: dict, trusted: list[bytes]) -> bool:
     log_id = sct.get("log_id")
     if not isinstance(log_id, (bytes, bytearray, memoryview)):
         return False
-    return len(bytes(log_id)) == _LOG_ID_SIZE
+    candidate = bytes(log_id)
+    if len(candidate) != _LOG_ID_SIZE:
+        return False
+    for entry in trusted or ():
+        try:
+            candidate_id = _as_bytes(entry, name="trusted_log_id")
+        except TypeError:
+            continue
+        if hmac.compare_digest(candidate_id, candidate):
+            return True
+    return False
 
 
 def check_tree_size(sct: dict, proof: dict) -> bool:
     """Return whether the tree size covers the supplied leaf index."""
     size = int(sct.get("tree_size") or 0)
     index = int((proof or {}).get("leaf_index") or 0)
-    if size == 0:
-        return True
-    return size >= index
+    if size == 0 or index < 0:
+        return False
+    return index < size
 
 
 def leaf_hash(cert: bytes, issuer: bytes | None = None) -> bytes:
@@ -151,8 +169,31 @@ def check_signature(sct: dict, log_key: bytes) -> bool:
     if hash_algorithm != HASH_SHA256 or signature_algorithm != SIGNATURE_HMAC_SHA256:
         return False
 
-    expected = hmac.new(key, _signed_payload(sct), hashlib.sha256).digest()
+    try:
+        payload = _signed_payload(sct)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+    expected = hmac.new(key, payload, hashlib.sha256).digest()
     return hmac.compare_digest(expected, tag)
+
+
+def _lookup_log_key(log_id: bytes, log_keys) -> bytes | None:
+    """Return the key registered for ``log_id``, or ``None`` when absent."""
+    if not isinstance(log_keys, dict):
+        return None
+    for candidate, key in log_keys.items():
+        try:
+            if isinstance(candidate, str):
+                candidate_bytes = bytes.fromhex(candidate)
+            else:
+                candidate_bytes = _as_bytes(candidate, name="log_id")
+            if candidate_bytes != log_id:
+                continue
+            return _as_bytes(key, name="log_key")
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def validate_sct(sct: dict, policy: dict) -> list[str]:
@@ -164,7 +205,11 @@ def validate_sct(sct: dict, policy: dict) -> list[str]:
         problems.append("unsupported_version")
 
     timestamp = sct.get("timestamp")
+    missing_timestamp = timestamp is None
+    if missing_timestamp:
+        problems.append("missing_timestamp")
 
+    log_id = sct.get("log_id")
     if not check_log_id(sct, settings.get("trusted_log_ids") or ()):
         problems.append("unknown_log")
 
@@ -177,20 +222,34 @@ def validate_sct(sct: dict, policy: dict) -> list[str]:
 
     cert = settings.get("cert")
     if cert is not None:
-        expected = sct.get("leaf_hash")
         computed = leaf_hash(cert, settings.get("issuer"))
-        if expected is None or len(computed) != len(
-            _as_bytes(expected, name="leaf_hash")
-        ):
+        expected = sct.get("leaf_hash")
+        try:
+            expected_bytes = _as_bytes(expected, name="leaf_hash")
+        except TypeError:
+            expected_bytes = None
+        if expected_bytes != computed:
             problems.append("leaf_hash_mismatch")
 
-    signature = (sct.get("signature") or {}).get("signature") or b""
-    if len(_as_bytes(signature, name="signature")) != _LEAF_HASH_SIZE:
+    log_key = None
+    if isinstance(log_id, (bytes, bytearray, memoryview)):
+        log_key = _lookup_log_key(bytes(log_id), settings.get("log_keys"))
+    if log_key is None:
+        problems.append("signature_key_missing")
+    elif not check_signature(sct, log_key):
         problems.append("invalid_signature")
 
     not_before = settings.get("cert_not_before")
-    if timestamp is not None and not_before is not None and timestamp < not_before:
-        problems.append("signature_time_outside_cert_validity")
+    not_after = settings.get("cert_not_after")
+    if (
+        not missing_timestamp
+        and isinstance(timestamp, int)
+        and not isinstance(timestamp, bool)
+    ):
+        if not_before is not None and timestamp < not_before:
+            problems.append("signature_time_outside_cert_validity")
+        elif not_after is not None and timestamp > not_after:
+            problems.append("signature_time_outside_cert_validity")
 
     return problems
 
@@ -200,10 +259,6 @@ def sct_batch(items: list[dict], policy: dict) -> dict:
     settings = dict(policy or {})
     results: dict[int, dict] = {}
 
-    shared_hash = b""
-    if items:
-        shared_hash = leaf_hash(items[0]["cert"], items[0].get("issuer"))
-
     for position, item in enumerate(items):
         item_policy = dict(settings)
         item_policy.update(item.get("policy") or {})
@@ -212,13 +267,13 @@ def sct_batch(items: list[dict], policy: dict) -> dict:
         item_policy["leaf_index"] = item.get(
             "leaf_index", item_policy.get("leaf_index", 0)
         )
-        item_policy["_leaf_hash_override"] = shared_hash
 
         problems = validate_sct(item["sct"], item_policy)
+        computed = leaf_hash(item["cert"], item.get("issuer"))
         results[position] = {
             "valid": not problems,
             "problems": problems,
-            "leaf_hash": shared_hash.hex(),
+            "leaf_hash": computed.hex(),
         }
 
     return results
